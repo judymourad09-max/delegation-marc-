@@ -1,0 +1,894 @@
+/* ---------------- Supabase Credentials Setup ---------------- */
+const SUPABASE_URL = "https://ypdzkmjdpjqjkhplnfgd.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_hHW0L04cexjhsUHLKu_QjA_o41djmit";
+
+let supabaseClient;
+
+try {
+  if (window.supabase && window.supabase.createClient) {
+    supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  } else {
+    document.getElementById('app').innerHTML = `<div style="padding:40px; text-align:center; color:red;"><h3>Failed to load Supabase SDK.</h3></div>`;
+  }
+} catch (e) {
+  console.error("Initialization Error:", e);
+}
+
+/* ---------------- Config ---------------- */
+const RESPONSIBILITIES = [
+  "Obtaining Informed Consent", "Medical History & Physical Exam", "Eligibility Screening (I/E criteria)",
+  "IP (Study Drug) Administration", "PK Blood Sample Collection", "Sample Processing, Labeling & Storage",
+  "Vital Signs / Safety Monitoring", "AE / SAE Assessment & Reporting", "Source Document Completion",
+  "CRF / eCRF Completion", "IP Accountability & Storage", "Randomization Code Access",
+  "Bioanalytical Sample Analysis", "Protocol Deviation Reporting", "Data Management / Entry", "QA / QC Review"
+];
+
+const ROLES = [
+  { id: "PI", label: "Principal Investigator", canCreateStudy: true, canDelegate: true, canApprove: true, readOnly: false },
+  { id: "SUBI", label: "Sub-Investigator", canCreateStudy: false, canDelegate: false, canApprove: false, readOnly: false },
+  { id: "CRC", label: "Clinical Research Coordinator", canCreateStudy: false, canDelegate: false, canApprove: false, readOnly: false },
+  { id: "PHARM", label: "Pharmacist", canCreateStudy: false, canDelegate: false, canApprove: false, readOnly: false },
+  { id: "NURSE", label: "Study Nurse", canCreateStudy: false, canDelegate: false, canApprove: false, readOnly: false },
+  { id: "QA", label: "Quality Assurance", canCreateStudy: false, canDelegate: false, canApprove: false, readOnly: true },
+  { id: "MONITOR", label: "Monitor", canCreateStudy: false, canDelegate: false, canApprove: false, readOnly: true },
+  { id: "SPONSOR", label: "Sponsor", canCreateStudy: false, canDelegate: false, canApprove: false, readOnly: true },
+  { id: "ADMIN", label: "Administrator", canCreateStudy: true, canDelegate: true, canApprove: true, readOnly: false },
+];
+
+function getRole(id) { return ROLES.find(r => r.id === id) || ROLES[2]; }
+
+/* ---------------- Application State ---------------- */
+let state = { studies: [], entries: [], auditLog: [], users: [] };
+let currentUser = null;
+let screen = "login";
+let authMode = "login";
+let activeStudyId = null;
+let dashSearch = "";
+let dashStatusFilter = "all";
+let dashSort = "newest";
+let auditOpen = true;
+
+function nowIso() { return new Date().toISOString(); }
+function fmtTime(iso) { if (!iso) return '—'; const d = new Date(iso); return d.toLocaleString(undefined, { year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
+function fmtDate(iso) { if (!iso) return '—'; const d = new Date(iso); return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: '2-digit' }); }
+function escapeHtml(str) { const d = document.createElement('div'); d.textContent = str == null ? '' : str; return d.innerHTML; }
+
+/* ---------------- Database & Auth API Layer ---------------- */
+async function loadAllData() {
+  if (!supabaseClient) return;
+  const appEl = document.getElementById('app');
+
+  try {
+    const { data: { session }, error: authErr } = await supabaseClient.auth.getSession();
+    if (authErr) throw authErr;
+
+    if (session && session.user) {
+      const u = session.user;
+      currentUser = {
+        id: u.id,
+        email: u.email,
+        name: u.user_metadata?.full_name || u.email,
+        roleId: u.user_metadata?.role_id || "CRC",
+        savedSignature: u.user_metadata?.saved_signature || localStorage.getItem(`sig_${u.id}`) || null
+      };
+      screen = "dashboard";
+    } else {
+      currentUser = null;
+      screen = "login";
+    }
+
+    const { data: studies, error: errStudies } = await supabaseClient.from('studies').select('*');
+    if (errStudies) console.error("Error fetching studies:", errStudies);
+    state.studies = studies || [];
+
+    const { data: logs, error: errLogs } = await supabaseClient
+      .from('audit_log')
+      .select('*')
+      .order('created_at', { ascending: false });
+    
+    if (errLogs) console.error("Error fetching audit logs:", errLogs);
+    else state.auditLog = logs || [];
+
+    const { data: usersData, error: errUsers } = await supabaseClient.from('users').select('*');
+    if (!errUsers) {
+      state.users = usersData || [];
+    }
+
+    render();
+  } catch (e) {
+    console.error("Database connection failure:", e);
+    if (appEl) {
+      appEl.innerHTML = `<div style="padding:40px; text-align:center; color:#A8402F;">
+        <h3>Database Connection Issue</h3>
+        <p>${e.message || 'Could not fetch data from Supabase.'}</p>
+      </div>`;
+    }
+  }
+}
+
+async function loadStudyEntries(studyId) {
+  const { data: entries, error } = await supabaseClient
+    .from('delegation_entries')
+    .select('*')
+    .eq('study_id', studyId);
+
+  if (error) console.error("Error loading entries:", error);
+  else state.entries = entries || [];
+}
+
+async function logAudit(studyId, action, detail) {
+  const role = currentUser ? getRole(currentUser.roleId) : null;
+  const newLog = {
+    study_id: studyId || null,
+    user_name: currentUser ? currentUser.name : "System User",
+    user_role: role ? role.label : "—",
+    action: action,
+    detail: detail
+  };
+
+  const { data, error } = await supabaseClient.from('audit_log').insert([newLog]).select();
+  if (error) {
+    console.error("Failed to insert audit log:", error);
+  } else if (data && data.length > 0) {
+    state.auditLog.unshift(data[0]);
+    render();
+  }
+}
+
+/* ---------------- UI Render Engines ---------------- */
+function render() {
+  const app = document.getElementById('app');
+  if (!app) return;
+  
+  if (screen === 'login') { app.innerHTML = loginHtml(); bindLogin(); return; }
+  if (screen === 'dashboard') { app.innerHTML = topbarHtml() + dashboardHtml(); bindTopbar(); bindDashboard(); return; }
+  if (screen === 'study') { app.innerHTML = topbarHtml() + studyHtml(); bindTopbar(); bindStudy(); return; }
+  if (screen === 'admin') { app.innerHTML = topbarHtml() + adminHtml(); bindTopbar(); bindAdmin(); return; }
+}
+
+/* ---------------- Auth Module ---------------- */
+function loginHtml() {
+  const options = ROLES.map(r => `<option value="${r.id}">${r.label}</option>`).join('');
+  const isReg = authMode === 'register';
+
+  return `
+  <div class="wrap">
+    <div class="login-screen">
+      <div class="kicker">Delegation of Authority System</div>
+      <h1>${isReg ? 'Create Account' : 'Sign In'}</h1>
+      <div class="sub">Clinical Bioequivalence Center Portal</div>
+      
+      <div class="auth-tabs">
+        <button class="auth-tab ${!isReg ? 'active' : ''}" id="tab-login">Sign In</button>
+        <button class="auth-tab ${isReg ? 'active' : ''}" id="tab-register">Register</button>
+      </div>
+
+      ${isReg ? `<div class="field" style="margin-bottom:14px;"><label>Full Name</label><input id="auth-name" placeholder="e.g. Dr. Mona Farid"></div>` : ''}
+      
+      <div class="field" style="margin-bottom:14px;"><label>Email Address</label><input id="auth-email" type="email" placeholder="name@center.com"></div>
+      <div class="field" style="margin-bottom:14px;"><label>Password</label><input id="auth-pass" type="password" placeholder="••••••••"></div>
+      
+      ${isReg ? `<div class="field" style="margin-bottom:20px;"><label>Role</label><select id="auth-role">${options}</select></div>` : ''}
+
+      <button class="btn" id="auth-submit" style="width:100%; margin-top:10px;">${isReg ? 'Register Account' : 'Sign In'}</button>
+    </div>
+  </div>`;
+}
+
+function bindLogin() {
+  document.getElementById('tab-login')?.addEventListener('click', () => { authMode = 'login'; render(); });
+  document.getElementById('tab-register')?.addEventListener('click', () => { authMode = 'register'; render(); });
+
+  document.getElementById('auth-submit')?.addEventListener('click', async () => {
+    const email = document.getElementById('auth-email').value.trim();
+    const password = document.getElementById('auth-pass').value.trim();
+
+    if (!email || !password) { alert('Please enter both email and password.'); return; }
+
+    if (authMode === 'register') {
+      const name = document.getElementById('auth-name').value.trim();
+      const roleId = document.getElementById('auth-role').value;
+      if (!name) { alert('Full name is required.'); return; }
+
+      const { data, error } = await supabaseClient.auth.signUp({
+        email: email,
+        password: password,
+        options: { data: { full_name: name, role_id: roleId } }
+      });
+
+      if (error) {
+        alert("Registration failed: " + error.message);
+      } else {
+        await supabaseClient.from('users').insert([{ name, email, role_id: roleId }]);
+        alert("Registration successful! You can now sign in.");
+        authMode = 'login';
+        render();
+      }
+    } else {
+      const { data, error } = await supabaseClient.auth.signInWithPassword({
+        email: email,
+        password: password
+      });
+
+      if (error) {
+        alert("Sign in failed: " + error.message);
+      } else {
+        if (data.user) {
+          const { data: existingUser } = await supabaseClient.from('users').select('*').eq('email', data.user.email).single();
+          if (!existingUser) {
+            await supabaseClient.from('users').insert([{
+              name: data.user.user_metadata?.full_name || data.user.email,
+              email: data.user.email,
+              role_id: data.user.user_metadata?.role_id || 'CRC'
+            }]);
+          }
+        }
+        await loadAllData();
+      }
+    }
+  });
+}
+
+/* ---------------- Topbar Module ---------------- */
+function topbarHtml() {
+  const role = getRole(currentUser.roleId);
+  const isAdminOrPi = currentUser.roleId === 'ADMIN' || currentUser.roleId === 'PI';
+
+  return `<div class="wrap" style="padding-bottom:0;">
+    <div class="topbar">
+      <div>
+        <div class="kicker">Delegation of Authority System</div>
+        <h1 style="font-size:22px;">Bioequivalence Center</h1>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px; flex-wrap:wrap;">
+        <div class="who">Signed in as <b>${escapeHtml(currentUser.name)}</b> (${escapeHtml(currentUser.email)})</div>
+        <span class="role-badge">${role.label}</span>
+        ${isAdminOrPi ? `<button class="btn ghost small" id="goToAdminBtn">⚙️ Admin Dashboard</button>` : ''}
+        <button class="btn ghost small no-print" id="signOutBtn">Sign Out</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function bindTopbar() {
+  document.getElementById('signOutBtn')?.addEventListener('click', async () => {
+    await supabaseClient.auth.signOut();
+    currentUser = null;
+    screen = 'login';
+    render();
+  });
+  document.getElementById('goToAdminBtn')?.addEventListener('click', () => {
+    screen = 'admin';
+    render();
+  });
+}
+
+/* ---------------- Enhanced Admin Dashboard Module ---------------- */
+function adminHtml() {
+  const userRows = state.users.length === 0 
+    ? `<tr><td colspan="5" class="empty-state">No users found in database table.</td></tr>`
+    : state.users.map(u => `
+        <tr>
+          <td>${escapeHtml(u.name || '—')}</td>
+          <td>${escapeHtml(u.email || '—')}</td>
+          <td>
+            <select class="admin-role-select" data-userid="${u.id}" style="padding:4px 8px; border-radius:4px; border:1px solid #ccc;">
+              ${ROLES.map(r => `<option value="${r.id}" ${ (u.role_id === r.id \vert{}\vert{} u.role === r.id) ? 'selected' : ''}>${r.label}</option>`).join('')}
+            </select>
+          </td>
+          <td>${fmtDate(u.created_at)}</td>
+          <td>
+            <button class="btn ghost small save-role-btn" data-userid="${u.id}" style="color:#004D40; border-color:#004D40;">Update Role</button>
+          </td>
+        </tr>
+      `).join('');
+
+  const globalLogs = state.auditLog.length === 0
+    ? `<li style="padding: 10px; color: #888;">No audit records found.</li>`
+    : state.auditLog.map(a => `
+        <li style="margin-bottom:8px; border-bottom:1px solid #eee; padding-bottom:6px;">
+          <span style="color:#004D40; font-weight:bold;">[${fmtTime(a.created_at)}]</span> — 
+          <b>${escapeHtml(a.user_name)}</b> (${escapeHtml(a.user_role)}): 
+          <span style="color:#d9534f; font-weight:600;">${escapeHtml(a.action)}</span> — 
+          <i>${escapeHtml(a.detail || '')}</i>
+        </li>
+      `).join('');
+
+  return `
+  <div class="wrap">
+    <div class="study-header">
+      <button class="back-link no-print" onclick="backToDashboard()">← Back to Studies</button>
+      <h1>System Admin Control Center</h1>
+      <div class="grid">
+        <div><b>${state.studies.length}</b>Total Studies</div>
+        <div><b>${state.users.length}</b>Registered Users</div>
+        <div><b>${state.auditLog.length}</b>Audit Trail Events</div>
+      </div>
+    </div>
+
+    <div class="section-head" style="margin-top:20px;">
+      <h2>User Role Management</h2>
+    </div>
+    <table class="roster" style="margin-bottom:30px;">
+      <thead>
+        <tr><th>Name</th><th>Email</th><th>Change Role</th><th>Joined Date</th><th>Action</th></tr>
+      </thead>
+      <tbody>${userRows}</tbody>
+    </table>
+
+    <div class="section-head" style="display:flex; justify-content:space-between; align-items:center;">
+      <h2>Global System Audit Trail</h2>
+      <button class="btn ghost small" id="exportAuditCsvBtn">📥 Export Audit Trail (CSV)</button>
+    </div>
+    <div class="audit-panel" style="background:#fdfdfd; border:1px solid #ccc; padding:16px; border-radius:8px; margin-top:8px;">
+      <ul style="margin:0; font-size:13px; font-family:monospace; max-height:350px; overflow-y:auto; list-style:none; padding-left:0;">
+        ${globalLogs}
+      </ul>
+    </div>
+  </div>`;
+}
+
+function bindAdmin() {
+  document.querySelectorAll('.save-role-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const userId = e.target.getAttribute('data-userid');
+      const selectEl = document.querySelector(`.admin-role-select[data-userid="${userId}"]`);
+      const newRole = selectEl ? selectEl.value : 'CRC';
+
+      const { error } = await supabaseClient
+        .from('users')
+        .update({ role_id: newRole })
+        .eq('id', userId);
+
+      if (error) {
+        alert("Failed to update user role: " + error.message);
+      } else {
+        alert("User role updated successfully in Database!");
+        await logAudit(null, 'Admin Role Updated', `Changed role for user ID ${userId} to ${newRole}`);
+        loadAllData();
+      }
+    });
+  });
+
+  document.getElementById('exportAuditCsvBtn')?.addEventListener('click', () => {
+    if (state.auditLog.length === 0) { alert("No audit logs available to export."); return; }
+    
+    let csv = "Timestamp,User,Role,Action,Detail\n";
+    state.auditLog.forEach(a => {
+      csv += `"${a.created_at}","${a.user_name || ''}","${a.user_role || ''}","${a.action || ''}","${(a.detail || '').replace(/"/g, '')}"\n`;
+    });
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `GCP_Audit_Trail_${new Date().toISOString().slice(0,10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  });
+}
+
+/* ---------------- Dashboard Module ---------------- */
+function dashboardHtml() {
+  const role = getRole(currentUser.roleId);
+  let studies = state.studies.filter(s => {
+    const q = dashSearch.toLowerCase();
+    const matchQ = !q || [s.title, s.protocol, s.sponsor, s.pi].some(v => (v || '').toLowerCase().includes(q));
+    const matchStatus = dashStatusFilter === 'all' || (s.status || 'Planning') === dashStatusFilter;
+    return matchQ && matchStatus;
+  });
+
+  studies = studies.slice().sort((a, b) => dashSort === 'oldest'
+    ? new Date(a.created_at || 0) - new Date(b.created_at || 0)
+    : new Date(b.created_at || 0) - new Date(a.created_at || 0));
+
+  const cards = studies.map(s => `
+    <div class="study-card" onclick="openStudy('${s.id}')">
+      <div class="top-row">
+        <span class="proto-chip">${escapeHtml(s.protocol || 'NO CODE')}</span>
+        <span class="status-pill status-${statusClass(s.status)}">${escapeHtml(s.status || 'Planning')}</span>
+      </div>
+      <h3 style="margin-top:8px;">${escapeHtml(s.title)}</h3>
+      <div class="meta">
+        <div><b>Sponsor:</b> ${escapeHtml(s.sponsor || '—')}</div>
+        <div><b>PI:</b> ${escapeHtml(s.pi || '—')}</div>
+        ${s.site ? `<div><b>Site:</b> ${escapeHtml(s.site)}</div>` : ''}
+        ${s.start_date ? `<div><b>Start:</b> ${fmtDate(s.start_date)}</div>` : ''}
+      </div>
+    </div>
+  `).join('');
+
+  return `
+  <div class="wrap">
+    <div class="section-head">
+      <h2>Studies <span class="count">(${studies.length})</span></h2>
+      <div class="toolbar no-print">
+        ${role.canCreateStudy ? `<button class="btn" id="newStudyBtn">+ New Study</button>` : ''}
+      </div>
+    </div>
+    <div class="dash-toolbar no-print">
+      <input id="dashSearchInput" placeholder="Search by title, protocol, sponsor, or PI..." value="${escapeHtml(dashSearch)}">
+      <select id="dashStatusInput">
+        <option value="all">All statuses</option>
+        <option value="Planning">Planning</option>
+        <option value="Active">Active</option>
+        <option value="Closed">Closed</option>
+      </select>
+      <select id="dashSortInput">
+        <option value="newest">Newest first</option>
+        <option value="oldest">Oldest first</option>
+      </select>
+    </div>
+    ${studies.length === 0
+      ? `<div class="empty-state">No studies found in Database. ${role.canCreateStudy ? 'Click "+ New Study" to add one.' : ''}</div>`
+      : `<div class="study-grid">${cards}</div>`}
+  </div>`;
+}
+
+function statusClass(status) {
+  if (status === 'Active') return 'active';
+  if (status === 'Closed') return 'inactive';
+  return 'pending';
+}
+
+function bindDashboard() {
+  const role = getRole(currentUser.roleId);
+  document.getElementById('dashSearchInput')?.addEventListener('input', e => { dashSearch = e.target.value; render(); });
+  if (document.getElementById('dashStatusInput')) {
+    document.getElementById('dashStatusInput').value = dashStatusFilter;
+    document.getElementById('dashStatusInput').addEventListener('change', e => { dashStatusFilter = e.target.value; render(); });
+  }
+  if (document.getElementById('dashSortInput')) {
+    document.getElementById('dashSortInput').value = dashSort;
+    document.getElementById('dashSortInput').addEventListener('change', e => { dashSort = e.target.value; render(); });
+  }
+  if (role.canCreateStudy) {
+    document.getElementById('newStudyBtn')?.addEventListener('click', openNewStudyModal);
+  }
+}
+
+function openNewStudyModal() {
+  closeModal();
+  const div = document.createElement('div'); div.id = 'modalRoot';
+  document.body.appendChild(div);
+  div.innerHTML = `
+  <div class="overlay" id="ov-study">
+    <div class="modal">
+      <h3>New Study</h3>
+      <div class="modal-sub">Add a study record to Database.</div>
+      <div class="field"><label>Study Title</label><input id="ns-title" placeholder="e.g. BE Study of Drug X 100mg"></div>
+      <div class="two-col">
+        <div class="field"><label>Protocol Number</label><input id="ns-protocol" placeholder="e.g. BE-2026-014"></div>
+        <div class="field"><label>Status</label>
+          <select id="ns-status"><option>Planning</option><option>Active</option><option>Closed</option></select>
+        </div>
+      </div>
+      <div class="two-col">
+        <div class="field"><label>Sponsor / CRO</label><input id="ns-sponsor"></div>
+        <div class="field"><label>Principal Investigator</label><input id="ns-pi"></div>
+      </div>
+      <div class="two-col">
+        <div class="field"><label>Site / Facility</label><input id="ns-site"></div>
+        <div class="field"><label>Start Date</label><input id="ns-start" type="date"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn secondary" id="ns-cancel">Cancel</button>
+        <button class="btn" id="ns-save">Add Study</button>
+      </div>
+    </div>
+  </div>`;
+
+  document.getElementById('ns-cancel').addEventListener('click', closeModal);
+  document.getElementById('ns-save').addEventListener('click', async () => {
+    const title = document.getElementById('ns-title').value.trim();
+    if (!title) { alert('Study title is required.'); return; }
+
+    const newStudy = {
+      title,
+      protocol: document.getElementById('ns-protocol').value.trim(),
+      status: document.getElementById('ns-status').value,
+      sponsor: document.getElementById('ns-sponsor').value.trim(),
+      pi: document.getElementById('ns-pi').value.trim(),
+      site: document.getElementById('ns-site').value.trim(),
+      start_date: document.getElementById('ns-start').value || null
+    };
+
+    const { data, error } = await supabaseClient.from('studies').insert([newStudy]).select();
+    if (error) {
+      alert("Database error: " + error.message);
+    } else {
+      state.studies.push(data[0]);
+      await logAudit(data[0].id, 'Study Created', `Created study "${title}"`);
+      closeModal();
+      render();
+    }
+  });
+}
+
+async function openStudy(id) {
+  activeStudyId = id;
+  await loadStudyEntries(id);
+  screen = 'study';
+  auditOpen = true;
+  render();
+}
+
+function backToDashboard() { activeStudyId = null; screen = 'dashboard'; render(); }
+function closeModal() { document.getElementById('modalRoot')?.remove(); }
+
+/* ---------------- Study Details View ---------------- */
+function currentStudy() { return state.studies.find(s => s.id === activeStudyId); }
+
+function computeStatus(entry) {
+  if (entry.deactivated) return 'inactive';
+  if (entry.end_date && new Date(entry.end_date) < new Date()) return 'inactive';
+  if (entry.signature_name && entry.pi_approval_name) return 'active';
+  return 'pending';
+}
+
+function studyHtml() {
+  const study = currentStudy();
+  const role = getRole(currentUser.roleId);
+  const isUserPi = currentUser.roleId === 'PI';
+
+  if (!study) return `<div class="wrap"><div class="empty-state">Study not found.</div></div>`;
+
+  const rows = state.entries.length === 0
+    ? `<tr><td colspan="9"><div class="empty-state" style="border:none;">No team members delegated yet.</div></td></tr>`
+    : state.entries.map(entry => {
+      const status = computeStatus(entry);
+      const statusLabel = status === 'active' ? 'Active' : status === 'pending' ? 'Pending Signatures' : 'Inactive';
+
+      const sigHtml = entry.signature_name
+        ? `<div class="sig-block">
+             <span class="sig-stamp">DIGITALLY SIGNED</span><br>
+             ${entry.signature_img ? `<img src="${entry.signature_img}" style="max-height:45px; margin:4px 0; border-bottom:1px dashed #004D40;"><br>` : ''}
+             <b>${escapeHtml(entry.signature_name)}</b><br>
+             <span class="sig-time">${fmtTime(entry.signature_timestamp)}</span>
+           </div>`
+        : `<span class="sig-empty">Awaiting staff signature</span>`;
+
+      const piHtml = entry.pi_approval_name
+        ? `<div class="sig-block">
+             <span class="sig-stamp">PI APPROVED</span><br>
+             ${entry.pi_approval_img ? `<img src="${entry.pi_approval_img}" style="max-height:45px; margin:4px 0; border-bottom:1px dashed #004D40;"><br>` : ''}
+             <b>${escapeHtml(entry.pi_approval_name)}</b><br>
+             <span class="sig-time">${fmtTime(entry.pi_approval_timestamp)}</span>
+           </div>`
+        : `<span class="sig-empty">Awaiting PI approval</span>`;
+
+      const canStaffSign = !entry.signature_name && !role.readOnly && !isUserPi;
+      const canPiApprove = entry.signature_name && !entry.pi_approval_name && (role.canApprove || isUserPi);
+      const canEnd = !entry.deactivated && role.canDelegate;
+
+      let respList = [];
+      if (Array.isArray(entry.responsibilities)) {
+        respList = entry.responsibilities;
+      } else if (typeof entry.responsibilities === 'string') {
+        try { respList = JSON.parse(entry.responsibilities); } catch(e) { respList = [entry.responsibilities]; }
+      }
+
+      return `<tr>
+        <td data-label="Name" class="name-cell">${escapeHtml(entry.name)}</td>
+        <td data-label="Role" class="role-cell">${escapeHtml(entry.role)}</td>
+        <td data-label="Delegated Tasks"><div class="tags">${respList.map(r => `<span class="tag">${escapeHtml(r)}</span>`).join('')}</div></td>
+        <td data-label="Period">${fmtDate(entry.start_date)} → ${entry.end_date ? fmtDate(entry.end_date) : 'ongoing'}</td>
+        <td data-label="Training / CV">${entry.training_date ? 'Trained ' + fmtDate(entry.training_date) : '—'}<br>${entry.cv_on_file ? 'CV on file' : 'CV pending'}</td>
+        <td data-label="Staff Signature">${sigHtml}</td>
+        <td data-label="PI Approval">${piHtml}</td>
+        <td data-label="Status"><span class="status-pill status-${status}">${statusLabel}</span></td>
+        <td data-label="Actions" class="no-print">
+          <div class="row-actions">
+            ${canStaffSign ? `<button class="btn ghost small" onclick="openCanvasModal('${entry.id}','staff')">✍️ E-Sign Staff</button>` : ''}
+            ${canPiApprove ? `<button class="btn ghost small" onclick="openCanvasModal('${entry.id}','pi')">✍️ E-Sign PI Approval</button>` : ''}
+            ${canEnd ? `<button class="btn ghost small" onclick="endDelegation('${entry.id}')">End delegation</button>` : ''}
+          </div>
+        </td>
+      </tr>`;
+    }).join('');
+
+  const studyAudit = state.auditLog.filter(a => String(a.study_id) === String(activeStudyId) || !a.study_id);
+  const auditHtml = studyAudit.length === 0
+    ? `<li style="padding: 10px; color: #888;">No activity logged yet.</li>`
+    : studyAudit.map(a => `<li style="margin-bottom:8px; border-bottom:1px solid #eee; padding-bottom:6px;">
+        <span style="color:#004D40; font-weight:bold;">[${fmtTime(a.created_at)}]</span> — 
+        <b>${escapeHtml(a.user_name)}</b> (${escapeHtml(a.user_role)}): 
+        <span style="color:#d9534f; font-weight:600;">${escapeHtml(a.action)}</span> — 
+        <i>${escapeHtml(a.detail || '')}</i>
+      </li>`).join('');
+
+  return `
+  <div class="wrap">
+    <div class="study-header">
+      <button class="back-link no-print" onclick="backToDashboard()">← All Studies</button>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">
+        <h1>${escapeHtml(study.title)}</h1>
+        <span class="status-pill status-${statusClass(study.status)}">${escapeHtml(study.status || 'Planning')}</span>
+      </div>
+      <div class="grid">
+        <div><b>${escapeHtml(study.protocol || '—')}</b>Protocol Number</div>
+        <div><b>${escapeHtml(study.sponsor || '—')}</b>Sponsor / CRO</div>
+        <div><b>${escapeHtml(study.pi || '—')}</b>Principal Investigator</div>
+        <div><b>${escapeHtml(study.site || '—')}</b>Site</div>
+      </div>
+    </div>
+
+    <div class="section-head">
+      <h2>Study Team Roster <span class="count">(${state.entries.length})</span></h2>
+      <div class="toolbar no-print">
+        <button class="btn secondary" onclick="window.print()">Print / Export</button>
+        ${role.canDelegate ? `<button class="btn" onclick="openAddModal()">+ Delegate Team Member</button>` : ''}
+      </div>
+    </div>
+
+    <table class="roster">
+      <thead><tr>
+        <th>Name</th><th>Role</th><th>Delegated Tasks</th><th>Period</th>
+        <th>Training / CV</th><th>Staff Signature</th><th>PI Approval</th><th>Status</th><th class="no-print">Actions</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+
+    <div class="section-head" style="margin-top:24px;"><h2>Full GCP Audit Trail</h2></div>
+    <div class="audit-panel" style="background:#fdfdfd; border:1px solid #ccc; padding:16px; border-radius:8px;">
+      <button class="audit-toggle no-print" id="auditToggleBtn">${auditOpen ? 'Hide Audit Trail' : 'Show Audit Trail'} (${studyAudit.length} Records)</button>
+      <ul class="audit-list" id="auditListEl" style="display:${auditOpen ? 'block' : 'none'}; margin-top:12px; font-size:13px; font-family:monospace; max-height:300px; overflow-y:auto; list-style:none; padding-left:0;">${auditHtml}</ul>
+    </div>
+  </div>`;
+}
+
+function bindStudy() {
+  document.getElementById('auditToggleBtn')?.addEventListener('click', () => {
+    auditOpen = !auditOpen;
+    render();
+  });
+}
+
+function openAddModal() {
+  closeModal();
+  const div = document.createElement('div'); div.id = 'modalRoot';
+  document.body.appendChild(div);
+  div.innerHTML = `
+  <div class="overlay" id="ov-add">
+    <div class="modal">
+      <h3>Delegate Team Member</h3>
+      <div class="modal-sub">Assign GCP responsibilities to staff members.</div>
+      <div class="two-col">
+        <div class="field"><label>Full Name</label><input id="m-name" placeholder="e.g. Dr. Mona Farid"></div>
+        <div class="field"><label>Role / Position</label><input id="m-role" placeholder="e.g. Sub-Investigator"></div>
+      </div>
+      <div class="field"><label>Delegated Responsibilities</label>
+        <div class="checklist">${RESPONSIBILITIES.map((r, i) => `<label><input type="checkbox" value="${escapeHtml(r)}" id="resp-${i}"> ${r}</label>`).join('')}</div>
+      </div>
+      <div class="two-col">
+        <div class="field"><label>Delegation Start Date</label><input id="m-start" type="date"></div>
+        <div class="field"><label>GCP / Training Date</label><input id="m-training" type="date"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn secondary" id="add-cancel">Cancel</button>
+        <button class="btn" id="add-save">Add to Roster</button>
+      </div>
+    </div>
+  </div>`;
+
+  document.getElementById('add-cancel').addEventListener('click', closeModal);
+  document.getElementById('add-save').addEventListener('click', async () => {
+    const name = document.getElementById('m-name').value.trim();
+    const roleTxt = document.getElementById('m-role').value.trim();
+    if (!name || !roleTxt) { alert('Name and role are required.'); return; }
+    const responsibilities = RESPONSIBILITIES.filter((r, i) => document.getElementById(`resp-${i}`).checked);
+    if (responsibilities.length === 0) { alert('Select at least one delegated responsibility.'); return; }
+
+    const entry = {
+      study_id: activeStudyId,
+      name,
+      role: roleTxt,
+      responsibilities,
+      start_date: document.getElementById('m-start').value || new Date().toISOString().slice(0, 10),
+      training_date: document.getElementById('m-training').value || null,
+      cv_on_file: true,
+      deactivated: false
+    };
+
+    const { data, error } = await supabaseClient.from('delegation_entries').insert([entry]).select();
+    if (error) {
+      alert("Database error: " + error.message);
+    } else {
+      state.entries.push(data[0]);
+      await logAudit(activeStudyId, 'Member Delegated', `Delegated ${name} (${roleTxt}) with ${responsibilities.length} tasks`);
+      closeModal();
+      render();
+    }
+  });
+}
+
+/* ---------------- Enhanced E-Signature Pad Modal ---------------- */
+function openCanvasModal(entryId, kind) {
+  closeModal();
+  const isPi = kind === 'pi';
+  const entry = state.entries.find(e => e.id === entryId);
+  const defaultName = isPi ? currentUser.name : (entry ? entry.name : currentUser.name);
+
+  const div = document.createElement('div'); div.id = 'modalRoot';
+  document.body.appendChild(div);
+
+  const hasSavedSig = !!currentUser.savedSignature;
+
+  div.innerHTML = `
+  <div class="overlay">
+    <div class="modal" style="max-width:460px;">
+      <h3>${isPi ? 'PI Approval E-Signature' : 'Staff E-Signature Pad'}</h3>
+      <div class="modal-sub">Draw or load your legally binding 21 CFR Part 11 signature.</div>
+      
+      <div class="field" style="margin-bottom:12px;">
+        <label>Full Name Confirmation</label>
+        <input id="cnv-name" value="${escapeHtml(defaultName)}">
+      </div>
+      
+      <div class="field">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+          <label style="margin:0;">Signature Pad</label>
+          ${hasSavedSig ? `<button class="btn ghost small" id="cnv-load-saved" style="font-size:11px; padding:2px 8px; color:#004D40; border-color:#004D40;">⚡ Load Saved Signature</button>` : ''}
+        </div>
+        <div style="border: 2px dashed #004D40; border-radius: 8px; background:#fff; position:relative;">
+          <canvas id="paintCanvas" width="400" height="160" style="width:100%; height:160px; cursor:crosshair; touch-action:none;"></canvas>
+        </div>
+      </div>
+      
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px; flex-wrap:wrap; gap:6px;">
+        <button class="btn ghost small" id="cnv-clear">Clear Pad</button>
+        <button class="btn ghost small" id="cnv-save-profile" style="color:#d9534f; border-color:#d9534f;">💾 Save as My Signature</button>
+      </div>
+
+      <div class="modal-actions" style="margin-top:16px;">
+        <button class="btn secondary" id="cnv-cancel">Cancel</button>
+        <button class="btn" id="cnv-save">Sign & Confirm</button>
+      </div>
+    </div>
+  </div>`;
+
+  const canvas = document.getElementById('paintCanvas');
+  const ctx = canvas.getContext('2d');
+  let isDrawing = false;
+  let hasDrawn = false;
+
+  ctx.strokeStyle = "#004D40";
+  ctx.lineWidth = 2.5;
+  ctx.lineCap = "round";
+
+  function getCoordinates(e) {
+    const rect = canvas.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    return {
+      x: (clientX - rect.left) * (canvas.width / rect.width),
+      y: (clientY - rect.top) * (canvas.height / rect.height)
+    };
+  }
+
+  function startPosition(e) {
+    isDrawing = true;
+    hasDrawn = true;
+    const pos = getCoordinates(e);
+    ctx.beginPath();
+    ctx.moveTo(pos.x, pos.y);
+  }
+
+  function draw(e) {
+    if (!isDrawing) return;
+    e.preventDefault();
+    const pos = getCoordinates(e);
+    ctx.lineTo(pos.x, pos.y);
+    ctx.stroke();
+  }
+
+  function finishedPosition() {
+    isDrawing = false;
+  }
+
+  canvas.addEventListener('mousedown', startPosition);
+  canvas.addEventListener('mousemove', draw);
+  canvas.addEventListener('mouseup', finishedPosition);
+  canvas.addEventListener('mouseleave', finishedPosition);
+
+  canvas.addEventListener('touchstart', startPosition, { passive: false });
+  canvas.addEventListener('touchmove', draw, { passive: false });
+  canvas.addEventListener('touchend', finishedPosition);
+
+  document.getElementById('cnv-clear').addEventListener('click', () => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    hasDrawn = false;
+  });
+
+  document.getElementById('cnv-load-saved')?.addEventListener('click', () => {
+    if (currentUser.savedSignature) {
+      const img = new Image();
+      img.onload = function() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        hasDrawn = true;
+      };
+      img.src = currentUser.savedSignature;
+    }
+  });
+
+  document.getElementById('cnv-save-profile')?.addEventListener('click', async () => {
+    if (!hasDrawn) { alert("Please draw a signature first."); return; }
+    const dataUrl = canvas.toDataURL("image/png");
+    
+    currentUser.savedSignature = dataUrl;
+    localStorage.setItem(`sig_${currentUser.id}`, dataUrl);
+
+    await supabaseClient.auth.updateUser({
+      data: { saved_signature: dataUrl }
+    });
+
+    alert("Signature saved successfully to your profile!");
+    openCanvasModal(entryId, kind);
+  });
+
+  document.getElementById('cnv-cancel').addEventListener('click', closeModal);
+
+  document.getElementById('cnv-save').addEventListener('click', async () => {
+    const sigName = document.getElementById('cnv-name').value.trim();
+    if (!sigName) { alert('Please enter full name.'); return; }
+    if (!hasDrawn) { alert('Please draw or load a signature.'); return; }
+
+    ctx.font = "10px monospace";
+    ctx.fillStyle = "#666666";
+    const timestampStr = new Date().toISOString();
+    ctx.fillText(`Digitally Signed by: ${sigName}`, 10, canvas.height - 18);
+    ctx.fillText(`Timestamp: ${timestampStr}`, 10, canvas.height - 6);
+
+    const dataUrl = canvas.toDataURL("image/png");
+
+    const updatePayload = isPi ? {
+      pi_approval_name: sigName,
+      pi_approval_timestamp: nowIso(),
+      pi_approval_img: dataUrl
+    } : {
+      signature_name: sigName,
+      signature_timestamp: nowIso(),
+      signature_img: dataUrl
+    };
+
+    const { error } = await supabaseClient.from('delegation_entries').update(updatePayload).eq('id', entryId);
+
+    if (error) {
+      alert("Database Error: " + error.message);
+    } else {
+      await loadStudyEntries(activeStudyId);
+      await logAudit(
+        activeStudyId, 
+        isPi ? 'PI Approval Signed' : 'Staff Signature Signed', 
+        `E-Signed for ${entry ? entry.name : sigName} [Timestamp: ${timestampStr}]`
+      );
+      closeModal();
+      render();
+    }
+  });
+}
+
+async function endDelegation(entryId) {
+  const entry = state.entries.find(e => e.id === entryId);
+  if (!entry) return;
+  if (!confirm(`End delegation for ${entry.name}?`)) return;
+
+  const endDate = new Date().toISOString().slice(0, 10);
+  const { error } = await supabaseClient
+    .from('delegation_entries')
+    .update({ deactivated: true, end_date: endDate })
+    .eq('id', entryId);
+
+  if (error) {
+    alert("Database error: " + error.message);
+  } else {
+    await loadStudyEntries(activeStudyId);
+    await logAudit(activeStudyId, 'Delegation Ended', `Ended delegation for ${entry.name}`);
+    render();
+  }
+}
+
+// Boot Loader
+loadAllData();
